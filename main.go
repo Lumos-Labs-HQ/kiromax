@@ -13,34 +13,75 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 )
 
 const (
-	kiroDir    = "/home/rana/.local/share/kiro-cli"
-	dataDB     = "/home/rana/.local/share/kiro-cli/data.sqlite3"
+	dataDB      = "/home/rana/.local/share/kiro-cli/data.sqlite3"
 	kiroDataDir = "/home/rana/.local/share/kiro-cli/kiro_data"
 )
 
 type Session struct {
 	ID      string
+	UUID    string
 	File    string
 	Active  bool
 	Ended   bool
-	Token   string
 	Expires time.Time
+	Token   string
 }
 
 type SocialToken struct {
-	AccessToken  string `json:"access_token"`
-	ExpiresAt    string `json:"expires_at"`
-	RefreshToken string `json:"refresh_token"`
-	Provider     string `json:"provider"`
-	ProfileARN   string `json:"profile_arn"`
+	AccessToken string `json:"access_token"`
+	ExpiresAt   string `json:"expires_at"`
 }
 
 func openDB(path string) (*sql.DB, error) {
-	return sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS kiromax_meta (key TEXT PRIMARY KEY, value TEXT)`)
+	return db, nil
+}
+
+func getMeta(db *sql.DB, key, def string) string {
+	var v string
+	if err := db.QueryRow(`SELECT value FROM kiromax_meta WHERE key=?`, key).Scan(&v); err == nil {
+		return v
+	}
+	db.Exec(`INSERT INTO kiromax_meta(key,value) VALUES(?,?)`, key, def)
+	return def
+}
+
+func setMeta(db *sql.DB, key, val string) {
+	db.Exec(`INSERT OR REPLACE INTO kiromax_meta(key,value) VALUES(?,?)`, key, val)
+}
+
+func loadSession(name string) (Session, error) {
+	path := filepath.Join(kiroDataDir, name+".sqlite3")
+	db, err := openDB(path)
+	if err != nil {
+		return Session{}, err
+	}
+	defer db.Close()
+
+	uid := getMeta(db, "uuid", uuid.New().String())
+	ended := getMeta(db, "ended", "false") == "true"
+
+	var token string
+	var expires time.Time
+	var raw string
+	if err := db.QueryRow(`SELECT value FROM auth_kv WHERE key='kirocli:social:token'`).Scan(&raw); err == nil {
+		var t SocialToken
+		if json.Unmarshal([]byte(raw), &t) == nil {
+			token = t.AccessToken
+			expires, _ = time.Parse(time.RFC3339Nano, t.ExpiresAt)
+		}
+	}
+
+	return Session{ID: name, UUID: uid, File: path, Ended: ended, Token: token, Expires: expires}, nil
 }
 
 func listSessions() ([]Session, error) {
@@ -48,38 +89,20 @@ func listSessions() ([]Session, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Get active session token from main db
-	activeToken := getActiveToken(dataDB)
-
+	activeToken := liveActiveToken()
 	var sessions []Session
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sqlite3") {
 			continue
 		}
-		path := filepath.Join(kiroDataDir, e.Name())
-		id := strings.TrimSuffix(e.Name(), ".sqlite3")
-
-		db, err := openDB(path)
+		name := strings.TrimSuffix(e.Name(), ".sqlite3")
+		s, err := loadSession(name)
 		if err != nil {
 			continue
 		}
-		token, expires := getTokenInfo(db)
-		db.Close()
-
-		ended := isEnded(path)
-		active := !ended && activeToken != "" && token != "" && token == activeToken
-
-		sessions = append(sessions, Session{
-			ID:      id,
-			File:    path,
-			Active:  active,
-			Ended:   ended,
-			Token:   token,
-			Expires: expires,
-		})
+		s.Active = !s.Ended && activeToken != "" && s.Token != "" && s.Token == activeToken
+		sessions = append(sessions, s)
 	}
-
 	sort.Slice(sessions, func(i, j int) bool {
 		a, _ := strconv.Atoi(sessions[i].ID)
 		b, _ := strconv.Atoi(sessions[j].ID)
@@ -88,150 +111,140 @@ func listSessions() ([]Session, error) {
 	return sessions, nil
 }
 
-func getActiveToken(dbPath string) string {
-	db, err := openDB(dbPath)
+func liveActiveToken() string {
+	db, err := sql.Open("sqlite", dataDB)
 	if err != nil {
 		return ""
 	}
 	defer db.Close()
-	token, _ := getTokenInfo(db)
-	return token
-}
-
-func getTokenInfo(db *sql.DB) (string, time.Time) {
 	var raw string
-	err := db.QueryRow(`SELECT value FROM auth_kv WHERE key='kirocli:social:token'`).Scan(&raw)
-	if err != nil {
-		return "", time.Time{}
+	if err := db.QueryRow(`SELECT value FROM auth_kv WHERE key='kirocli:social:token'`).Scan(&raw); err != nil {
+		return ""
 	}
 	var t SocialToken
-	if err := json.Unmarshal([]byte(raw), &t); err != nil {
-		return "", time.Time{}
+	json.Unmarshal([]byte(raw), &t)
+	return t.AccessToken
+}
+
+// usedThisMonth: token was issued (expires ~1h after issue) in the current calendar month.
+func usedThisMonth(s Session) bool {
+	if s.Expires.IsZero() {
+		return false
 	}
-	exp, _ := time.Parse(time.RFC3339Nano, t.ExpiresAt)
-	return t.AccessToken[:min(20, len(t.AccessToken))], exp
+	now := time.Now()
+	return s.Expires.Year() == now.Year() && s.Expires.Month() == now.Month()
 }
 
-func isEnded(dbPath string) bool {
-	marker := dbPath + ".ended"
-	_, err := os.Stat(marker)
-	return err == nil
-}
-
-func markEnded(dbPath string) error {
-	marker := dbPath + ".ended"
-	f, err := os.Create(marker)
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	f.Close()
-	return nil
+	return os.WriteFile(dst, data, 0600)
 }
 
-func unmarkEnded(dbPath string) error {
-	marker := dbPath + ".ended"
-	return os.Remove(marker)
-}
-
-func swapSession(id string) error {
-	path := filepath.Join(kiroDataDir, id+".sqlite3")
-	if _, err := os.Stat(path); err != nil {
-		return fmt.Errorf("session %s not found", id)
-	}
-	if isEnded(path) {
-		return fmt.Errorf("session %s is marked as ended", id)
-	}
-
-	// Copy session db over main data.sqlite3
-	src, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dataDB, src, 0600)
-}
-
-func markAllEnded() error {
+func autoSwap() error {
 	sessions, err := listSessions()
 	if err != nil {
 		return err
 	}
+
+	// mark current active as ended
 	for _, s := range sessions {
-		if !s.Ended {
-			if err := markEnded(s.File); err != nil {
+		if s.Active {
+			db, err := openDB(s.File)
+			if err != nil {
 				return err
 			}
+			setMeta(db, "ended", "true")
+			db.Close()
+			fmt.Printf("→ Marked session %s [%s] as ended\n", s.ID, s.UUID[:8])
+			break
 		}
 	}
+
+	// pick next: not ended AND not used this month
+	for _, s := range sessions {
+		if s.Ended || s.Active {
+			continue
+		}
+		if usedThisMonth(s) {
+			continue
+		}
+		if err := copyFile(s.File, dataDB); err != nil {
+			return err
+		}
+		fmt.Printf("✓ Swapped to session %s [%s] — restart kiro-cli to apply\n", s.ID, s.UUID[:8])
+		return nil
+	}
+
+	fmt.Println("✗ All sessions are ended or already used this month.")
+	fmt.Println("  Run: kiromax reset   to unend all sessions")
+	return nil
+}
+
+func useSession(id string) error {
+	s, err := loadSession(id)
+	if err != nil {
+		return fmt.Errorf("session %s not found", id)
+	}
+	sessions, _ := listSessions()
+	for _, cur := range sessions {
+		if cur.Active {
+			db, _ := openDB(cur.File)
+			setMeta(db, "ended", "true")
+			db.Close()
+			fmt.Printf("→ Marked session %s [%s] as ended\n", cur.ID, cur.UUID[:8])
+			break
+		}
+	}
+	if err := copyFile(s.File, dataDB); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Swapped to session %s [%s] — restart kiro-cli to apply\n", s.ID, s.UUID[:8])
 	return nil
 }
 
 type UsageBreakdown struct {
-	DisplayName              string  `json:"displayName"`
-	CurrentUsage             float64 `json:"currentUsageWithPrecision"`
-	UsageLimit               float64 `json:"usageLimitWithPrecision"`
-	ResourceType             string  `json:"resourceType"`
+	DisplayName               string  `json:"displayName"`
+	CurrentUsageWithPrecision float64 `json:"currentUsageWithPrecision"`
+	UsageLimitWithPrecision   float64 `json:"usageLimitWithPrecision"`
 }
 
-type UsageLimitsResponse struct {
-	DaysUntilReset    int              `json:"daysUntilReset"`
-	UsageBreakdownList []UsageBreakdown `json:"usageBreakdownList"`
-	SubscriptionInfo  struct {
-		SubscriptionTitle string `json:"subscriptionTitle"`
-	} `json:"subscriptionInfo"`
-}
-
-func fetchCredits(dbPath string) string {
-	db, err := openDB(dbPath)
-	if err != nil {
-		return "err"
-	}
-	defer db.Close()
-
-	var raw string
-	if err := db.QueryRow(`SELECT value FROM auth_kv WHERE key='kirocli:social:token'`).Scan(&raw); err != nil {
-		return "no token"
-	}
-	var t SocialToken
-	if err := json.Unmarshal([]byte(raw), &t); err != nil {
-		return "err"
-	}
-	if time.Now().After(func() time.Time { e, _ := time.Parse(time.RFC3339Nano, t.ExpiresAt); return e }()) {
-		return "expired"
-	}
-
+func fetchCredits(token string) string {
 	req, _ := http.NewRequest("GET", "https://codewhisperer.us-east-1.amazonaws.com/getUsageLimits", nil)
-	req.Header.Set("Authorization", "Bearer "+t.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
 	if err != nil {
 		return "offline"
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-
-	var usage UsageLimitsResponse
-	if err := json.Unmarshal(body, &usage); err != nil || len(usage.UsageBreakdownList) == 0 {
+	var result struct {
+		UsageBreakdownList []UsageBreakdown `json:"usageBreakdownList"`
+	}
+	if json.Unmarshal(body, &result) != nil || len(result.UsageBreakdownList) == 0 {
 		return "N/A"
 	}
-
 	var parts []string
-	for _, u := range usage.UsageBreakdownList {
-		parts = append(parts, fmt.Sprintf("%s %.0f/%.0f", u.DisplayName, u.CurrentUsage, u.UsageLimit))
+	for _, u := range result.UsageBreakdownList {
+		parts = append(parts, fmt.Sprintf("%s %.0f/%.0f", u.DisplayName, u.CurrentUsageWithPrecision, u.UsageLimitWithPrecision))
 	}
 	return strings.Join(parts, " | ")
 }
 
 func printHelp() {
-	fmt.Println(`kiromax - Kiro session manager
+	fmt.Print(`kiromax - Kiro session manager
 
 Commands:
-  list              List all sessions with status
-  swap <id>         Swap to session by ID (replaces active data.sqlite3)
-  end <id>          Mark session as ended
-  unend <id>        Remove ended mark from session
-  reset             Mark ALL sessions as ended
-  help              Show this help`)
+  list           List all sessions
+  swap           Auto-swap to next available session (marks current as ended)
+  use <id>       Force swap to specific session ID
+  end <id>       Mark session as ended
+  reset          Unend ALL sessions (make available again)
+  credits <id>   Show live credit usage for a session
+`)
 }
 
 func main() {
@@ -240,21 +253,19 @@ func main() {
 		return
 	}
 
-	cmd := os.Args[1]
-
-	switch cmd {
+	switch os.Args[1] {
 	case "list":
 		sessions, err := listSessions()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
 		if len(sessions) == 0 {
 			fmt.Println("No sessions found in", kiroDataDir)
 			return
 		}
-		fmt.Printf("%-6s %-8s %-8s %-22s %s\n", "ID", "STATUS", "ENDED", "EXPIRES", "CREDITS")
-		fmt.Println(strings.Repeat("-", 75))
+		fmt.Printf("%-4s %-10s %-8s %-6s %-22s\n", "ID", "UUID", "STATUS", "ENDED", "EXPIRES")
+		fmt.Println(strings.Repeat("-", 56))
 		for _, s := range sessions {
 			status := "idle"
 			if s.Active {
@@ -269,65 +280,71 @@ func main() {
 				if time.Now().After(s.Expires) {
 					exp = "EXPIRED"
 				} else {
-					exp = s.Expires.Format("2006-01-02 15:04:05")
+					exp = s.Expires.Format("2006-01-02 15:04")
 				}
 			}
-			credits := fetchCredits(s.File)
-			fmt.Printf("%-6s %-8s %-8s %-22s %s\n", s.ID, status, ended, exp, credits)
+			fmt.Printf("%-4s %-10s %-8s %-6s %-22s\n", s.ID, s.UUID[:8], status, ended, exp)
 		}
 
 	case "swap":
+		if err := autoSwap(); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+
+	case "use":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: kiromax swap <id>")
+			fmt.Fprintln(os.Stderr, "usage: kiromax use <id>")
 			os.Exit(1)
 		}
-		id := os.Args[2]
-		if err := swapSession(id); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		if err := useSession(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
-		fmt.Printf("✓ Swapped to session %s (restart kiro-cli to apply)\n", id)
 
 	case "end":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "usage: kiromax end <id>")
 			os.Exit(1)
 		}
-		id := os.Args[2]
-		path := filepath.Join(kiroDataDir, id+".sqlite3")
-		if _, err := os.Stat(path); err != nil {
-			fmt.Fprintf(os.Stderr, "session %s not found\n", id)
+		db, err := openDB(filepath.Join(kiroDataDir, os.Args[2]+".sqlite3"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "session not found")
 			os.Exit(1)
 		}
-		if err := markEnded(path); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("✓ Session %s marked as ended\n", id)
-
-	case "unend":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: kiromax unend <id>")
-			os.Exit(1)
-		}
-		id := os.Args[2]
-		path := filepath.Join(kiroDataDir, id+".sqlite3")
-		if err := unmarkEnded(path); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("✓ Session %s unended\n", id)
+		setMeta(db, "ended", "true")
+		db.Close()
+		fmt.Printf("✓ Session %s marked as ended\n", os.Args[2])
 
 	case "reset":
-		if err := markAllEnded(); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		sessions, err := listSessions()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
-		fmt.Println("✓ All sessions marked as ended")
+		for _, s := range sessions {
+			db, err := openDB(s.File)
+			if err != nil {
+				continue
+			}
+			setMeta(db, "ended", "false")
+			db.Close()
+		}
+		fmt.Println("✓ All sessions unended — available for swap again")
+
+	case "credits":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: kiromax credits <id>")
+			os.Exit(1)
+		}
+		s, err := loadSession(os.Args[2])
+		if err != nil || s.Token == "" {
+			fmt.Fprintln(os.Stderr, "no token for session", os.Args[2])
+			os.Exit(1)
+		}
+		fmt.Println(fetchCredits(s.Token))
 
 	default:
 		printHelp()
 	}
 }
-
-
