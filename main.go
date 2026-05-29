@@ -207,18 +207,6 @@ func useSession(id string) error {
 	if err != nil {
 		return fmt.Errorf("session %s not found", id)
 	}
-	sessions, _ := listSessions()
-	for _, cur := range sessions {
-		if cur.Active && cur.UUID != s.UUID {
-			db, _ := openDB(cur.File)
-			setMeta(db, "ended", "true")
-			db.Close()
-			fmt.Printf("→ Marked session %s [%s] as ended\n", cur.ID, cur.UUID[:8])
-			break
-		}
-	}
-	// reload to get fresh state (ended may have changed)
-	s, _ = loadSession(id)
 	if err := swapTo(s); err != nil {
 		return err
 	}
@@ -304,6 +292,8 @@ func main() {
 			status := "idle"
 			if s.Active {
 				status = "ACTIVE"
+			} else if s.Ended {
+				status = "ended"
 			}
 			ended := "no"
 			if s.Ended {
@@ -347,20 +337,32 @@ func main() {
 		fmt.Printf("✓ Session %s marked as ended\n", os.Args[2])
 
 	case "reset":
-		sessions, err := listSessions()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		for _, s := range sessions {
-			db, err := openDB(s.File)
+		if len(os.Args) >= 3 {
+			// reset single session
+			db, err := openDB(filepath.Join(kiroDataDir, os.Args[2]+".sqlite3"))
 			if err != nil {
-				continue
+				fmt.Fprintln(os.Stderr, "session not found")
+				os.Exit(1)
 			}
 			setMeta(db, "ended", "false")
 			db.Close()
+			fmt.Printf("✓ Session %s unended\n", os.Args[2])
+		} else {
+			sessions, err := listSessions()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			for _, s := range sessions {
+				db, err := openDB(s.File)
+				if err != nil {
+					continue
+				}
+				setMeta(db, "ended", "false")
+				db.Close()
+			}
+			fmt.Println("✓ All sessions unended — available for swap again")
 		}
-		fmt.Println("✓ All sessions unended — available for swap again")
 
 	case "credits":
 		if len(os.Args) < 3 {
