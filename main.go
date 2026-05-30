@@ -17,23 +17,34 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const (
-	dataDB      = "/home/rana/.local/share/kiro-cli/data.sqlite3"
-	kiroDataDir = "/home/rana/.local/share/kiro-cli/kiro_data"
+func kiroBase() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic("cannot determine home directory: " + err.Error())
+	}
+	return filepath.Join(home, ".local", "share", "kiro-cli")
+}
+
+var (
+	dataDB      = filepath.Join(kiroBase(), "data.sqlite3")
+	kiroDataDir = filepath.Join(kiroBase(), "kiro_data")  // need to create this directory manually and put session sqlite3 files there, named like "work.sqlite3", "personal.sqlite3", etc.
 )
 
 type Session struct {
-	ID     string
-	UUID   string
-	File   string
-	Active bool
-	Ended  bool
-	Token  string
-	UsedAt time.Time
+	ID             int
+	UUID           string
+	File           string
+	FileName       string
+	Active         bool
+	Ended          bool
+	Token          string
+	TokenExpiresAt time.Time
+	UsedAt         time.Time
 }
 
 type SocialToken struct {
 	AccessToken string `json:"access_token"`
+	ExpiresAt   string `json:"expires_at"`
 }
 
 func openDB(path string) (*sql.DB, error) {
@@ -75,15 +86,17 @@ func loadSession(name string) (Session, error) {
 	}
 
 	var token string
+	var tokenExpiresAt time.Time
 	var raw string
 	if err := db.QueryRow(`SELECT value FROM auth_kv WHERE key='kirocli:social:token'`).Scan(&raw); err == nil {
 		var t SocialToken
 		if json.Unmarshal([]byte(raw), &t) == nil {
 			token = t.AccessToken
+			tokenExpiresAt, _ = time.Parse(time.RFC3339Nano, t.ExpiresAt)
 		}
 	}
 
-	return Session{ID: name, UUID: uid, File: path, Ended: ended, Token: token, UsedAt: usedAt}, nil
+	return Session{UUID: uid, File: path, FileName: name, Ended: ended, Token: token, TokenExpiresAt: tokenExpiresAt, UsedAt: usedAt}, nil
 }
 
 func listSessions() ([]Session, error) {
@@ -106,10 +119,16 @@ func listSessions() ([]Session, error) {
 		sessions = append(sessions, s)
 	}
 	sort.Slice(sessions, func(i, j int) bool {
-		a, _ := strconv.Atoi(sessions[i].ID)
-		b, _ := strconv.Atoi(sessions[j].ID)
-		return a < b
+		a, aerr := strconv.Atoi(sessions[i].FileName)
+		b, berr := strconv.Atoi(sessions[j].FileName)
+		if aerr == nil && berr == nil {
+			return a < b
+		}
+		return sessions[i].FileName < sessions[j].FileName
 	})
+	for i := range sessions {
+		sessions[i].ID = i + 1
+	}
 	return sessions, nil
 }
 
@@ -171,7 +190,7 @@ func autoSwap() error {
 			}
 			setMeta(db, "ended", "true")
 			db.Close()
-			fmt.Printf("→ Marked session %s [%s] as ended\n", s.ID, s.UUID[:8])
+			fmt.Printf("→ Marked session %d [%s] (%s) as ended\n", s.ID, s.UUID[:8], s.FileName)
 			break
 		}
 	}
@@ -193,7 +212,7 @@ func autoSwap() error {
 		if err := swapTo(s); err != nil {
 			return err
 		}
-		fmt.Printf("✓ Swapped to session %s [%s] — restart kiro-cli to apply\n", s.ID, s.UUID[:8])
+		fmt.Printf("✓ Swapped to session %d [%s] (%s) — restart kiro-cli to apply\n", s.ID, s.UUID[:8], s.FileName)
 		return nil
 	}
 
@@ -202,15 +221,37 @@ func autoSwap() error {
 	return nil
 }
 
-func useSession(id string) error {
-	s, err := loadSession(id)
+// resolveSession accepts a numeric ID (e.g. "2") or a filename (e.g. "work").
+func resolveSession(arg string) (Session, error) {
+	sessions, err := listSessions()
 	if err != nil {
-		return fmt.Errorf("session %s not found", id)
+		return Session{}, err
+	}
+	if n, err2 := strconv.Atoi(arg); err2 == nil {
+		for _, s := range sessions {
+			if s.ID == n {
+				return s, nil
+			}
+		}
+		return Session{}, fmt.Errorf("no session with id %s", arg)
+	}
+	for _, s := range sessions {
+		if s.FileName == arg {
+			return s, nil
+		}
+	}
+	return Session{}, fmt.Errorf("session %q not found", arg)
+}
+
+func useSession(arg string) error {
+	s, err := resolveSession(arg)
+	if err != nil {
+		return err
 	}
 	if err := swapTo(s); err != nil {
 		return err
 	}
-	fmt.Printf("✓ Swapped to session %s [%s] — restart kiro-cli to apply\n", s.ID, s.UUID[:8])
+	fmt.Printf("✓ Swapped to session %d [%s] (%s) — restart kiro-cli to apply\n", s.ID, s.UUID[:8], s.FileName)
 	return nil
 }
 
@@ -286,8 +327,8 @@ func main() {
 			fmt.Println("No sessions found in", kiroDataDir)
 			return
 		}
-		fmt.Printf("%-4s %-10s %-8s %-6s %-16s\n", "ID", "UUID", "STATUS", "ENDED", "USED")
-		fmt.Println(strings.Repeat("-", 48))
+		fmt.Printf("%-4s %-20s %-10s %-8s %-6s %-16s\n", "ID", "FILE", "UUID", "STATUS", "ENDED", "USED")
+		fmt.Println(strings.Repeat("-", 68))
 		for _, s := range sessions {
 			status := "idle"
 			if s.Active {
@@ -303,7 +344,7 @@ func main() {
 			if !s.UsedAt.IsZero() {
 				used = s.UsedAt.Format("2006-01-02 15:04")
 			}
-			fmt.Printf("%-4s %-10s %-8s %-6s %-16s\n", s.ID, s.UUID[:8], status, ended, used)
+			fmt.Printf("%-4d %-20s %-10s %-8s %-6s %-16s\n", s.ID, s.FileName, s.UUID[:8], status, ended, used)
 		}
 
 	case "swap":
@@ -324,29 +365,30 @@ func main() {
 
 	case "end":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: kiromax end <id>")
+			fmt.Fprintln(os.Stderr, "usage: kiromax end <id|name>")
 			os.Exit(1)
 		}
-		db, err := openDB(filepath.Join(kiroDataDir, os.Args[2]+".sqlite3"))
+		s, err := resolveSession(os.Args[2])
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "session not found")
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		db, _ := openDB(s.File)
 		setMeta(db, "ended", "true")
 		db.Close()
-		fmt.Printf("✓ Session %s marked as ended\n", os.Args[2])
+		fmt.Printf("✓ Session %d (%s) marked as ended\n", s.ID, s.FileName)
 
 	case "reset":
 		if len(os.Args) >= 3 {
-			// reset single session
-			db, err := openDB(filepath.Join(kiroDataDir, os.Args[2]+".sqlite3"))
+			s, err := resolveSession(os.Args[2])
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "session not found")
+				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
+			db, _ := openDB(s.File)
 			setMeta(db, "ended", "false")
 			db.Close()
-			fmt.Printf("✓ Session %s unended\n", os.Args[2])
+			fmt.Printf("✓ Session %d (%s) unended\n", s.ID, s.FileName)
 		} else {
 			sessions, err := listSessions()
 			if err != nil {
@@ -365,14 +407,52 @@ func main() {
 		}
 
 	case "credits":
+		var s Session
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: kiromax credits <id>")
+			// default to active session
+			sessions, err := listSessions()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			for _, ss := range sessions {
+				if ss.Active {
+					s = ss
+					break
+				}
+			}
+			if s.FileName == "" {
+				fmt.Fprintln(os.Stderr, "no active session; specify: kiromax credits <id|name>")
+				os.Exit(1)
+			}
+		} else {
+			var err error
+			s, err = resolveSession(os.Args[2])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
+		if s.Active {
+			// use live data.sqlite3 token — kiro-cli refreshes it there
+			if liveDB, err := openDB(dataDB); err == nil {
+				var raw string
+				if liveDB.QueryRow(`SELECT value FROM auth_kv WHERE key='kirocli:social:token'`).Scan(&raw) == nil {
+					var t SocialToken
+					if json.Unmarshal([]byte(raw), &t) == nil {
+						s.Token = t.AccessToken
+						s.TokenExpiresAt, _ = time.Parse(time.RFC3339Nano, t.ExpiresAt)
+					}
+				}
+				liveDB.Close()
+			}
+		}
+		if s.Token == "" {
+			fmt.Fprintln(os.Stderr, "no token for session", s.FileName)
 			os.Exit(1)
 		}
-		s, err := loadSession(os.Args[2])
-		if err != nil || s.Token == "" {
-			fmt.Fprintln(os.Stderr, "no token for session", os.Args[2])
-			os.Exit(1)
+		if !s.TokenExpiresAt.IsZero() && time.Now().After(s.TokenExpiresAt) {
+			fmt.Fprintf(os.Stderr, "warning: token expired at %s — swap to this session to refresh\n", s.TokenExpiresAt.Local().Format("2006-01-02 15:04"))
 		}
 		result, err := callUsageLimits(s.Token)
 		if err != nil {
@@ -384,7 +464,7 @@ func main() {
 			return
 		}
 		for _, u := range result.UsageBreakdownList {
-			fmt.Printf("%s: %.0f / %.0f\n", u.DisplayName, u.CurrentUsageWithPrecision, u.UsageLimitWithPrecision)
+			fmt.Printf("%s: %.2f / %.0f\n", u.DisplayName, u.CurrentUsageWithPrecision, u.UsageLimitWithPrecision)
 		}
 
 	default:
