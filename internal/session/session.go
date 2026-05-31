@@ -101,6 +101,58 @@ func UsedThisMonth(s Session) bool {
 	return s.UsedAt.Year() == now.Year() && s.UsedAt.Month() == now.Month()
 }
 
+// mergeConversations copies all conversations_v2 rows from src into dst.
+// Uses INSERT OR REPLACE so the row with the latest updated_at wins.
+func mergeConversations(srcPath, dstPath string) error {
+	src, err := db.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := db.Open(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	// ensure table exists in dst (may be a fresh session file)
+	_, err = dst.Exec(`CREATE TABLE IF NOT EXISTS conversations_v2 (
+		key TEXT NOT NULL,
+		conversation_id TEXT NOT NULL,
+		value TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (key, conversation_id)
+	)`)
+	if err != nil {
+		return err
+	}
+
+	rows, err := src.Query(`SELECT key, conversation_id, value, created_at, updated_at FROM conversations_v2`)
+	if err != nil {
+		return nil // table may not exist in src yet
+	}
+	defer rows.Close()
+
+	tx, _ := dst.Begin()
+	for rows.Next() {
+		var key, convID, value string
+		var createdAt, updatedAt int64
+		if rows.Scan(&key, &convID, &value, &createdAt, &updatedAt) != nil {
+			continue
+		}
+		tx.Exec(`INSERT INTO conversations_v2(key,conversation_id,value,created_at,updated_at)
+			VALUES(?,?,?,?,?)
+			ON CONFLICT(key,conversation_id) DO UPDATE SET
+				value=excluded.value,
+				updated_at=excluded.updated_at
+			WHERE excluded.updated_at > conversations_v2.updated_at`,
+			key, convID, value, createdAt, updatedAt)
+	}
+	return tx.Commit()
+}
+
 // SyncActiveBack saves the live data.sqlite3 back into the active session file
 // before a swap, preserving refreshed tokens and chat history.
 func SyncActiveBack(dataDB, kiroDataDir string) error {
@@ -124,11 +176,27 @@ func SyncActiveBack(dataDB, kiroDataDir string) error {
 	return nil
 }
 
-// SwapTo syncs current session back then copies target session to data.sqlite3.
+// SwapTo syncs current session back, merges global conversation history into
+// the target session, then copies target session to data.sqlite3.
 func SwapTo(s Session, dataDB, kiroDataDir string) error {
 	if err := SyncActiveBack(dataDB, kiroDataDir); err != nil {
 		return fmt.Errorf("failed to sync active session back: %w", err)
 	}
+
+	// Merge conversations from all other session files into the target,
+	// so --resume works regardless of which account is active.
+	entries, _ := os.ReadDir(kiroDataDir)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sqlite3") {
+			continue
+		}
+		srcPath := filepath.Join(kiroDataDir, e.Name())
+		if srcPath == s.File {
+			continue
+		}
+		_ = mergeConversations(srcPath, s.File)
+	}
+
 	data, err := os.ReadFile(s.File)
 	if err != nil {
 		return err
