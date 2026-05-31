@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -174,6 +176,18 @@ func main() {
 			fatal(err)
 		}
 
+	case "login":
+		if err := cmdLogin(); err != nil {
+			fatal(err)
+		}
+
+	case "continue", "c":
+		bin, err := exec.LookPath("kiro-cli-chat")
+		if err != nil {
+			fatal(fmt.Errorf("kiro-cli-chat not found on PATH"))
+		}
+		syscall.Exec(bin, []string{"kiro-cli-chat", "chat", "--resume-picker"}, os.Environ())
+
 	case "guild":
 		if len(os.Args) < 3 {
 			printGuildHelp()
@@ -256,8 +270,11 @@ Commands:
   end <id>                Mark session as ended
   reset [<id>]            Unend flat sessions
   credits [<id>]          Show credit usage for a session
+  login                   Log in to a new account and capture into a guild
+  continue, c             Pick & resume a previous conversation
 
-  capture <guild>             Snapshot current session into a guild (auto-numbered)
+  capture <guild>         Snapshot current session into a guild (auto-numbered)
+  guild list              List all guilds
   guild create <name>     Create a new guild
   guild add <g> <file>    Add a session file to a guild
   guild swap              Advance to next guild
