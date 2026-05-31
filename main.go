@@ -68,6 +68,78 @@ func autoSwap() error {
 	return nil
 }
 
+// runLogin logs in to a new kiro-cli account and saves the resulting session file.
+// It backs up the current data.sqlite3, runs kiro-cli login, moves the new DB to
+// kiro_data/<name>.sqlite3, then restores the original active session.
+func runLogin() error {
+	fmt.Print("Session name (e.g. 6, work): ")
+	var name string
+	fmt.Scanln(&name)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("session name cannot be empty")
+	}
+
+	dest := filepath.Join(kiroDataDir, name+".sqlite3")
+	if _, err := os.Stat(dest); err == nil {
+		return fmt.Errorf("session %q already exists", name)
+	}
+
+	tmp := dataDB + ".kiromax_tmp"
+	if err := copyFile(dataDB, tmp); err != nil {
+		return fmt.Errorf("failed to back up data.sqlite3: %w", err)
+	}
+
+	// Remove data.sqlite3 so kiro-cli sees no existing login
+	if err := os.Remove(dataDB); err != nil {
+		return fmt.Errorf("failed to clear data.sqlite3: %w", err)
+	}
+
+	fmt.Println()
+	ui.Info("Starting kiro-cli login (Builder ID)...")
+	fmt.Println()
+
+	cmd := exec.Command("kiro-cli", "login", "--license", "free")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		_ = copyFile(tmp, dataDB)
+		_ = os.Remove(tmp)
+		return fmt.Errorf("login failed: %w", err)
+	}
+
+	if err := os.MkdirAll(kiroDataDir, 0700); err != nil {
+		return err
+	}
+
+	if err := copyFile(dataDB, dest); err != nil {
+		return err
+	}
+
+	if err := copyFile(tmp, dataDB); err != nil {
+		return err
+	}
+	_ = os.Remove(tmp)
+
+	fmt.Println()
+	ui.Success(fmt.Sprintf("Session %s saved — run 'kiromax use %s' to switch to it", ui.Bold(name), name))
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0600)
+}
+
+func die(args ...any) {
+	fmt.Fprintln(os.Stderr, args...)
+	os.Exit(1)
+}
+
 func printHelp() {
 	fmt.Println()
 	fmt.Println(ui.Bold(ui.Cyan("kiromax")) + ui.Dim(" — Kiro session manager"))
@@ -80,17 +152,13 @@ func printHelp() {
 		{"  end <id>      ", "Mark a session as ended"},
 		{"  reset [<id>]  ", "Unend all sessions (or one), clearing used_at"},
 		{"  credits [<id>]", "Show live credit usage (defaults to active)"},
-		{"  continue, c   ", "Pick & resume a previous conversation (resume-picker)"},
+		{"  login         ", "Log in to a new account and save it as a session"},
+		{"  continue, c   ", "Pick & resume a previous conversation"},
 	}
 	for _, r := range rows {
 		fmt.Println(ui.Cyan(r[0]) + ui.Dim(r[1]))
 	}
 	fmt.Println()
-}
-
-func die(args ...any) {
-	fmt.Fprintln(os.Stderr, args...)
-	os.Exit(1)
 }
 
 func main() {
@@ -118,7 +186,6 @@ func main() {
 		)
 
 		fmt.Println()
-		// header: plain text padded, then bolded as a whole line
 		header := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %s",
 			wID, "ID", wName, "NAME", wUUID, "UUID", wStatus, "STATUS", "LAST USED")
 		fmt.Println(ui.Bold(header))
@@ -137,34 +204,29 @@ func main() {
 				used = s.UsedAt.Format("2006-01-02 15:04")
 			}
 
-			// pad to fixed width before applying color
+			// Pad to fixed width before applying color so ANSI codes don't break alignment.
 			namePad   := fmt.Sprintf("%-*s", wName, s.FileName)
 			uuidPad   := fmt.Sprintf("%-*s", wUUID, s.UUID[:8])
 			statusPad := fmt.Sprintf("%-*s", wStatus, status)
 			usedPad   := used
+			idStr     := fmt.Sprintf("%-*d", wID, s.ID)
 
 			switch {
 			case s.Active:
+				idStr     = ui.Green(idStr)
 				namePad   = ui.Bold(ui.Green(namePad))
 				uuidPad   = ui.Green(uuidPad)
 				statusPad = ui.Green(statusPad)
 				usedPad   = ui.Green(used)
 			case s.Ended:
+				idStr     = ui.Dim(idStr)
 				namePad   = ui.Dim(namePad)
 				uuidPad   = ui.Dim(uuidPad)
 				statusPad = ui.Dim(statusPad)
 				usedPad   = ui.Dim(used)
 			}
 
-			idStr := fmt.Sprintf("%-*d", wID, s.ID)
-			if s.Active {
-				idStr = ui.Green(idStr)
-			} else if s.Ended {
-				idStr = ui.Dim(idStr)
-			}
-
-			fmt.Printf("  %s  %s  %s  %s  %s\n",
-				idStr, namePad, uuidPad, statusPad, usedPad)
+			fmt.Printf("  %s  %s  %s  %s  %s\n", idStr, namePad, uuidPad, statusPad, usedPad)
 		}
 		fmt.Println()
 
@@ -272,11 +334,15 @@ func main() {
 		}
 		fmt.Println()
 
-	case "continue", "c":
-		bin, err := exec.LookPath("kiro-cli-chat")
-		if err != nil {
-			die("kiro-cli-chat not found in PATH")
+	case "login":
+		fmt.Println()
+		if err := runLogin(); err != nil {
+			die("error:", err)
 		}
+		fmt.Println()
+
+	case "continue", "c":
+		bin, _ := exec.LookPath("kiro-cli-chat")
 		syscall.Exec(bin, []string{"kiro-cli-chat", "chat", "--resume-picker"}, os.Environ())
 
 	default:

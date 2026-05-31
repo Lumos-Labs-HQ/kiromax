@@ -106,7 +106,38 @@ func UsedThisMonth(s Session) bool {
 	return s.UsedAt.Year() == now.Year() && s.UsedAt.Month() == now.Month()
 }
 
-// mergeConversations copies conversations_v2 rows from src into dst.
+// syncMigrations copies any missing migration rows from src into dst.
+// This prevents kiro-cli from re-running migrations that were already applied
+// by a newer version of kiro-cli on a different session.
+func syncMigrations(srcPath, dstPath string) error {
+	src, err := db.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := db.Open(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	rows, err := src.Query(`SELECT id, version, migration_time FROM migrations`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, version, migTime int64
+		if rows.Scan(&id, &version, &migTime) != nil {
+			continue
+		}
+		dst.Exec(`INSERT OR IGNORE INTO migrations(id, version, migration_time) VALUES(?,?,?)`,
+			id, version, migTime)
+	}
+	return nil
+}
 // When a conversation exists in both, the row with the later updated_at wins.
 func mergeConversations(srcPath, dstPath string) error {
 	src, err := db.Open(srcPath)
@@ -121,16 +152,12 @@ func mergeConversations(srcPath, dstPath string) error {
 	}
 	defer dst.Close()
 
-	_, err = dst.Exec(`CREATE TABLE IF NOT EXISTS conversations_v2 (
-		key TEXT NOT NULL,
-		conversation_id TEXT NOT NULL,
-		value TEXT NOT NULL,
-		created_at INTEGER NOT NULL,
-		updated_at INTEGER NOT NULL,
-		PRIMARY KEY (key, conversation_id)
-	)`)
-	if err != nil {
-		return err
+	// Only merge if dst already has the table (kiro-cli creates it on first run).
+	// We must not create it ourselves — kiro-cli's migration would then fail.
+	var tblExists int
+	dst.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblExists)
+	if tblExists == 0 {
+		return nil
 	}
 
 	rows, err := src.Query(`SELECT key, conversation_id, value, created_at, updated_at FROM conversations_v2`)
@@ -203,6 +230,10 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 		_ = mergeConversations(srcPath, s.File)
 	}
 
+	// Sync migrations from the previously active session into the target file
+	// before activating it, so kiro-cli doesn't re-run already-applied migrations.
+	_ = syncMigrations(dataDB, s.File)
+
 	data, err := os.ReadFile(s.File)
 	if err != nil {
 		return err
@@ -210,6 +241,7 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 	if err := os.WriteFile(dataDB, data, 0600); err != nil {
 		return err
 	}
+
 	now := time.Now().Format(time.RFC3339)
 	for _, path := range []string{s.File, dataDB} {
 		d, err := db.Open(path)
