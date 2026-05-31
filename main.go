@@ -61,7 +61,6 @@ func getMeta(db *sql.DB, key, def string) string {
 	if err := db.QueryRow(`SELECT value FROM kiromax_meta WHERE key=?`, key).Scan(&v); err == nil {
 		return v
 	}
-	db.Exec(`INSERT INTO kiromax_meta(key,value) VALUES(?,?)`, key, def)
 	return def
 }
 
@@ -77,7 +76,11 @@ func loadSession(name string) (Session, error) {
 	}
 	defer db.Close()
 
-	uid := getMeta(db, "uuid", uuid.New().String())
+	uid := getMeta(db, "uuid", "")
+	if uid == "" {
+		uid = uuid.New().String()
+		setMeta(db, "uuid", uid)
+	}
 	ended := getMeta(db, "ended", "false") == "true"
 	usedAtStr := getMeta(db, "used_at", "")
 	var usedAt time.Time
@@ -282,21 +285,6 @@ func callUsageLimits(token string) (*UsageLimitsResp, error) {
 	return &result, nil
 }
 
-func fetchCredits(token string) string {
-	result, err := callUsageLimits(token)
-	if err != nil {
-		return "offline"
-	}
-	if len(result.UsageBreakdownList) == 0 {
-		return "N/A"
-	}
-	var parts []string
-	for _, u := range result.UsageBreakdownList {
-		parts = append(parts, fmt.Sprintf("%s %.0f/%.0f", u.DisplayName, u.CurrentUsageWithPrecision, u.UsageLimitWithPrecision))
-	}
-	return strings.Join(parts, " | ")
-}
-
 func printHelp() {
 	fmt.Print(`kiromax - Kiro session manager
 
@@ -373,7 +361,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		db, _ := openDB(s.File)
+		db, err := openDB(s.File)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 		setMeta(db, "ended", "true")
 		db.Close()
 		fmt.Printf("✓ Session %d (%s) marked as ended\n", s.ID, s.FileName)
@@ -385,8 +377,13 @@ func main() {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-			db, _ := openDB(s.File)
+			db, err := openDB(s.File)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
 			setMeta(db, "ended", "false")
+			setMeta(db, "used_at", "")
 			db.Close()
 			fmt.Printf("✓ Session %d (%s) unended\n", s.ID, s.FileName)
 		} else {
@@ -401,6 +398,7 @@ func main() {
 					continue
 				}
 				setMeta(db, "ended", "false")
+				setMeta(db, "used_at", "")
 				db.Close()
 			}
 			fmt.Println("✓ All sessions unended — available for swap again")
