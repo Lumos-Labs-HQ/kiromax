@@ -9,6 +9,7 @@ import (
 	"github.com/Lumos-Labs-HQ/kiromax/internal/credits"
 	"github.com/Lumos-Labs-HQ/kiromax/internal/db"
 	"github.com/Lumos-Labs-HQ/kiromax/internal/session"
+	"github.com/Lumos-Labs-HQ/kiromax/internal/ui"
 )
 
 func kiroBase() string {
@@ -38,7 +39,7 @@ func autoSwap() error {
 			}
 			db.SetMeta(d, "ended", "true")
 			d.Close()
-			fmt.Printf("→ Marked session %d [%s] (%s) as ended\n", s.ID, s.UUID[:8], s.FileName)
+			ui.Info(fmt.Sprintf("Saved & ended session %s %s", ui.Bold(s.FileName), ui.Dim("["+s.UUID[:8]+"]")))
 			break
 		}
 	}
@@ -55,26 +56,33 @@ func autoSwap() error {
 		if err := session.SwapTo(s, dataDB, kiroDataDir); err != nil {
 			return err
 		}
-		fmt.Printf("✓ Swapped to session %d [%s] (%s) — restart kiro-cli to apply\n", s.ID, s.UUID[:8], s.FileName)
+		ui.Success(fmt.Sprintf("Swapped to session %s %s — restart kiro-cli to apply",
+			ui.Bold(s.FileName), ui.Dim("["+s.UUID[:8]+"]")))
 		return nil
 	}
 
-	fmt.Println("✗ All sessions are ended or already used this month.")
-	fmt.Println("  Run: kiromax reset   to unend all sessions")
+	ui.Fail("All sessions are ended or already used this month.")
+	fmt.Println(ui.Dim("  Run: kiromax reset   to unend all sessions"))
 	return nil
 }
 
 func printHelp() {
-	fmt.Print(`kiromax - Kiro session manager
-
-Commands:
-  list           List all sessions
-  swap           Auto-swap to next available session (marks current as ended)
-  use <id>       Force swap to specific session ID
-  end <id>       Mark session as ended
-  reset [<id>]   Unend all sessions (or specific one), clearing used_at
-  credits [<id>] Show live credit usage (defaults to active session)
-`)
+	fmt.Println()
+	fmt.Println(ui.Bold(ui.Cyan("kiromax")) + ui.Dim(" — Kiro session manager"))
+	fmt.Println()
+	fmt.Println(ui.Bold("COMMANDS"))
+	rows := [][2]string{
+		{"  list          ", "List all sessions with status"},
+		{"  swap          ", "Auto-swap to next available session"},
+		{"  use <id>      ", "Force swap to a specific session"},
+		{"  end <id>      ", "Mark a session as ended"},
+		{"  reset [<id>]  ", "Unend all sessions (or one), clearing used_at"},
+		{"  credits [<id>]", "Show live credit usage (defaults to active)"},
+	}
+	for _, r := range rows {
+		fmt.Println(ui.Cyan(r[0]) + ui.Dim(r[1]))
+	}
+	fmt.Println()
 }
 
 func die(args ...any) {
@@ -95,11 +103,24 @@ func main() {
 			die("error:", err)
 		}
 		if len(sessions) == 0 {
-			fmt.Println("No sessions found in", kiroDataDir)
+			fmt.Println(ui.Dim("No sessions found in " + kiroDataDir))
 			return
 		}
-		fmt.Printf("%-4s %-20s %-10s %-8s %-6s %-16s\n", "ID", "FILE", "UUID", "STATUS", "ENDED", "USED")
-		fmt.Println(strings.Repeat("-", 68))
+
+		const (
+			wID     = 4
+			wName   = 12
+			wUUID   = 8
+			wStatus = 8
+		)
+
+		fmt.Println()
+		// header: plain text padded, then bolded as a whole line
+		header := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %s",
+			wID, "ID", wName, "NAME", wUUID, "UUID", wStatus, "STATUS", "LAST USED")
+		fmt.Println(ui.Bold(header))
+		fmt.Println("  " + ui.Dim(strings.Repeat("─", 56)))
+
 		for _, s := range sessions {
 			status := "idle"
 			if s.Active {
@@ -107,21 +128,49 @@ func main() {
 			} else if s.Ended {
 				status = "ended"
 			}
-			ended := "no"
-			if s.Ended {
-				ended = "YES"
-			}
+
 			used := "never"
 			if !s.UsedAt.IsZero() {
 				used = s.UsedAt.Format("2006-01-02 15:04")
 			}
-			fmt.Printf("%-4d %-20s %-10s %-8s %-6s %-16s\n", s.ID, s.FileName, s.UUID[:8], status, ended, used)
+
+			// pad to fixed width before applying color
+			namePad   := fmt.Sprintf("%-*s", wName, s.FileName)
+			uuidPad   := fmt.Sprintf("%-*s", wUUID, s.UUID[:8])
+			statusPad := fmt.Sprintf("%-*s", wStatus, status)
+			usedPad   := used
+
+			switch {
+			case s.Active:
+				namePad   = ui.Bold(ui.Green(namePad))
+				uuidPad   = ui.Green(uuidPad)
+				statusPad = ui.Green(statusPad)
+				usedPad   = ui.Green(used)
+			case s.Ended:
+				namePad   = ui.Dim(namePad)
+				uuidPad   = ui.Dim(uuidPad)
+				statusPad = ui.Dim(statusPad)
+				usedPad   = ui.Dim(used)
+			}
+
+			idStr := fmt.Sprintf("%-*d", wID, s.ID)
+			if s.Active {
+				idStr = ui.Green(idStr)
+			} else if s.Ended {
+				idStr = ui.Dim(idStr)
+			}
+
+			fmt.Printf("  %s  %s  %s  %s  %s\n",
+				idStr, namePad, uuidPad, statusPad, usedPad)
 		}
+		fmt.Println()
 
 	case "swap":
+		fmt.Println()
 		if err := autoSwap(); err != nil {
 			die("error:", err)
 		}
+		fmt.Println()
 
 	case "use":
 		if len(os.Args) < 3 {
@@ -131,10 +180,13 @@ func main() {
 		if err != nil {
 			die("error:", err)
 		}
+		fmt.Println()
 		if err := session.SwapTo(s, dataDB, kiroDataDir); err != nil {
 			die("error:", err)
 		}
-		fmt.Printf("✓ Swapped to session %d [%s] (%s) — restart kiro-cli to apply\n", s.ID, s.UUID[:8], s.FileName)
+		ui.Success(fmt.Sprintf("Swapped to session %s %s — restart kiro-cli to apply",
+			ui.Bold(s.FileName), ui.Dim("["+s.UUID[:8]+"]")))
+		fmt.Println()
 
 	case "end":
 		if len(os.Args) < 3 {
@@ -150,9 +202,12 @@ func main() {
 		}
 		db.SetMeta(d, "ended", "true")
 		d.Close()
-		fmt.Printf("✓ Session %d (%s) marked as ended\n", s.ID, s.FileName)
+		fmt.Println()
+		ui.Success(fmt.Sprintf("Session %s marked as ended", ui.Bold(s.FileName)))
+		fmt.Println()
 
 	case "reset":
+		fmt.Println()
 		if len(os.Args) >= 3 {
 			s, err := session.Resolve(os.Args[2], kiroDataDir, dataDB)
 			if err != nil {
@@ -165,7 +220,7 @@ func main() {
 			db.SetMeta(d, "ended", "false")
 			db.SetMeta(d, "used_at", "")
 			d.Close()
-			fmt.Printf("✓ Session %d (%s) unended\n", s.ID, s.FileName)
+			ui.Success(fmt.Sprintf("Session %s is available again", ui.Bold(s.FileName)))
 		} else {
 			sessions, err := session.List(kiroDataDir, dataDB)
 			if err != nil {
@@ -180,8 +235,9 @@ func main() {
 				db.SetMeta(d, "used_at", "")
 				d.Close()
 			}
-			fmt.Println("✓ All sessions unended — available for swap again")
+			ui.Success(fmt.Sprintf("All %d sessions unended — available for swap again", len(sessions)))
 		}
+		fmt.Println()
 
 	case "credits":
 		var s session.Session
@@ -206,9 +262,12 @@ func main() {
 				die(err)
 			}
 		}
+		fmt.Println()
+		fmt.Printf("  %s %s\n\n", ui.Bold("Credits for session"), ui.Cyan(s.FileName))
 		if err := credits.Print(s, dataDB); err != nil {
 			die("error:", err)
 		}
+		fmt.Println()
 
 	default:
 		printHelp()
