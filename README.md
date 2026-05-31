@@ -1,93 +1,48 @@
 # kiromax
 
-kiromax is a small command-line tool for managing multiple kiro-cli SQLite session
-files. It helps rotate sessions by copying a chosen session file to the live
-`data.sqlite3` used by `kiro-cli`, marking sessions as ended/unended, and
-querying live credit usage (when a social access token is present).
+Manage multiple kiro-cli accounts on a single machine. Swap between sessions, track monthly usage, and keep a unified conversation history across all accounts.
 
-## Overview
+## How it works
 
-- Each session is stored as `<id>.sqlite3` in the `kiro_data` directory.
-- The live profile used by `kiro-cli` is `data.sqlite3` (location configured
-  by the `dataDB` constant in the code).
-- `kiromax swap` marks the current active session as ended and selects the
-  next session that has not been used during the current month.
+Each account is stored as a `.sqlite3` file in `~/.local/share/kiro-cli/kiro_data/`. The active account is `~/.local/share/kiro-cli/data.sqlite3`.
 
+On every swap kiromax:
+1. Saves the current `data.sqlite3` back to the active session file (preserves chat history and refreshed tokens).
+2. Merges conversation history from all sessions into the target session, so `--resume` works regardless of which account is active.
+3. Copies the target session file to `data.sqlite3`.
 
+This means you can switch accounts mid-month and continue any previous conversation with `kiromax continue`.
 
-## Configuration
+## Setup
 
-By default `main.go` uses these paths (edit the constants in the source if
-needed):
-
-- `dataDB` — `/home/username/.local/share/kiro-cli/data.sqlite3`
-- `kiroDataDir` — `/home/username/.local/share/kiro-cli/kiro_data`
-
-Ensure the user running `kiromax` has read/write access to those files and
-directories.
-
-## Commands & Usage
-
-- `kiromax list`
-  - Lists session files found in `kiroDataDir` with status, ended flag, and
-    last-used time.
-
-- `kiromax swap`
-  - Auto-swap to the next available session. Marks the current active session
-    as ended, then copies the next unused session file to `data.sqlite3` and
-    records metadata.
-
-- `kiromax use <id>`
-  - Force swap to a specific session ID (copies `<id>.sqlite3` to `data.sqlite3`).
-
-- `kiromax end <id>`
-  - Mark the session `<id>` as ended (it will be skipped by `swap`).
-
-- `kiromax reset [<id>]`
-  - Without an ID: unend all sessions (make them available for swapping).
-  - With an ID: unend the specified session.
-
-- `kiromax credits <id>`
-  - Fetch live credit usage for the session using a social access token stored
-    inside that session's DB under `auth_kv` key `kirocli:social:token`.
-
-## Examples
-
-List sessions:
+Create the session directory and drop your session files in:
 
 ```bash
-./kiromax list
+mkdir -p ~/.local/share/kiro-cli/kiro_data
+# copy or move existing data.sqlite3 files there, named 1.sqlite3, 2.sqlite3, etc.
 ```
 
-Auto-swap (marks current active session ended and picks next unused):
+## Commands
 
-```bash
-./kiromax swap
+```
+kiromax list              List all sessions with status
+kiromax swap              Mark current session as ended, switch to next unused this month
+kiromax use <id>          Switch to a specific session by ID or name
+kiromax end <id>          Mark a session as ended (skipped by swap)
+kiromax reset [<id>]      Unend all sessions (or one), clearing used_at
+kiromax credits [<id>]    Show live credit usage (defaults to active session)
+kiromax continue          Open the conversation picker to resume any previous chat
+kiromax c                 Alias for continue
 ```
 
-Force use session `3`:
+## Session lifecycle
 
-```bash
-./kiromax use 3
-```
+- `swap` picks the next session that is not ended and was not used this calendar month.
+- `reset` clears both the ended flag and used_at, making sessions available again.
+- Sessions are identified by numeric ID (position in sorted file list) or filename.
 
-Check credits for session `3` (requires token stored in the session DB):
+## Notes
 
-```bash
-./kiromax credits 3
-```
-
-## Use cases
-
-- Rotate multiple kiro-cli accounts/profiles on a single machine.
-- Automatically cycle sessions once per calendar month.
-- Track which sessions were used and when via the `used_at` metadata.
-- Query remote usage/credits for sessions that contain a saved social token.
-
-## Implementation notes
-
-- The tool reads and writes a simple meta table `kiromax_meta` inside each
-  SQLite file. It also trusts the `auth_kv` table to contain JSON tokens for
-  the `credits` command.
-- Swapping is done by copying bytes from the session file to `data.sqlite3`.
-  This means file permissions for `data.sqlite3` must allow this operation.
+- Requires `kiro-cli-chat` to be on PATH for the `continue` command.
+- Session files must be readable and writable by the user running kiromax.
+- The `credits` command reads the OAuth token stored in the session DB. For the active session it always reads from the live `data.sqlite3` in case kiro-cli has refreshed the token.

@@ -25,6 +25,7 @@ type Session struct {
 	UsedAt         time.Time
 }
 
+// Load reads session metadata from a session file in kiroDataDir.
 func Load(name, kiroDataDir string) (Session, error) {
 	path := filepath.Join(kiroDataDir, name+".sqlite3")
 	d, err := db.Open(path)
@@ -51,6 +52,8 @@ func Load(name, kiroDataDir string) (Session, error) {
 	}, nil
 }
 
+// List returns all sessions in kiroDataDir, sorted numerically then alphabetically.
+// The session whose UUID matches the active_uuid in data.sqlite3 is marked Active.
 func List(kiroDataDir, dataDB string) ([]Session, error) {
 	entries, err := os.ReadDir(kiroDataDir)
 	if err != nil {
@@ -84,6 +87,7 @@ func List(kiroDataDir, dataDB string) ([]Session, error) {
 	return sessions, nil
 }
 
+// LiveActiveUUID returns the UUID of the session currently loaded in data.sqlite3.
 func LiveActiveUUID(dataDB string) string {
 	d, err := db.Open(dataDB)
 	if err != nil {
@@ -93,6 +97,7 @@ func LiveActiveUUID(dataDB string) string {
 	return db.GetMeta(d, "active_uuid")
 }
 
+// UsedThisMonth reports whether the session was swapped in during the current calendar month.
 func UsedThisMonth(s Session) bool {
 	if s.UsedAt.IsZero() {
 		return false
@@ -101,8 +106,8 @@ func UsedThisMonth(s Session) bool {
 	return s.UsedAt.Year() == now.Year() && s.UsedAt.Month() == now.Month()
 }
 
-// mergeConversations copies all conversations_v2 rows from src into dst.
-// Uses INSERT OR REPLACE so the row with the latest updated_at wins.
+// mergeConversations copies conversations_v2 rows from src into dst.
+// When a conversation exists in both, the row with the later updated_at wins.
 func mergeConversations(srcPath, dstPath string) error {
 	src, err := db.Open(srcPath)
 	if err != nil {
@@ -116,7 +121,6 @@ func mergeConversations(srcPath, dstPath string) error {
 	}
 	defer dst.Close()
 
-	// ensure table exists in dst (may be a fresh session file)
 	_, err = dst.Exec(`CREATE TABLE IF NOT EXISTS conversations_v2 (
 		key TEXT NOT NULL,
 		conversation_id TEXT NOT NULL,
@@ -131,7 +135,7 @@ func mergeConversations(srcPath, dstPath string) error {
 
 	rows, err := src.Query(`SELECT key, conversation_id, value, created_at, updated_at FROM conversations_v2`)
 	if err != nil {
-		return nil // table may not exist in src yet
+		return nil // table doesn't exist in src yet
 	}
 	defer rows.Close()
 
@@ -153,8 +157,9 @@ func mergeConversations(srcPath, dstPath string) error {
 	return tx.Commit()
 }
 
-// SyncActiveBack saves the live data.sqlite3 back into the active session file
-// before a swap, preserving refreshed tokens and chat history.
+// SyncActiveBack writes data.sqlite3 back to the active session file.
+// This preserves any state kiro-cli wrote during the session (refreshed tokens,
+// chat history) before we overwrite data.sqlite3 with a different session.
 func SyncActiveBack(dataDB, kiroDataDir string) error {
 	activeUUID := LiveActiveUUID(dataDB)
 	if activeUUID == "" {
@@ -176,15 +181,16 @@ func SyncActiveBack(dataDB, kiroDataDir string) error {
 	return nil
 }
 
-// SwapTo syncs current session back, merges global conversation history into
-// the target session, then copies target session to data.sqlite3.
+// SwapTo switches the active session:
+//  1. Saves the current data.sqlite3 back to the active session file.
+//  2. Merges conversation history from all sessions into the target, so
+//     --resume works across account switches.
+//  3. Copies the target session file to data.sqlite3.
 func SwapTo(s Session, dataDB, kiroDataDir string) error {
 	if err := SyncActiveBack(dataDB, kiroDataDir); err != nil {
 		return fmt.Errorf("failed to sync active session back: %w", err)
 	}
 
-	// Merge conversations from all other session files into the target,
-	// so --resume works regardless of which account is active.
 	entries, _ := os.ReadDir(kiroDataDir)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sqlite3") {
@@ -217,6 +223,7 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 	return nil
 }
 
+// Resolve finds a session by numeric ID or filename.
 func Resolve(arg, kiroDataDir, dataDB string) (Session, error) {
 	sessions, err := List(kiroDataDir, dataDB)
 	if err != nil {

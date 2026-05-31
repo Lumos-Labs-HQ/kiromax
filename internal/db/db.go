@@ -13,6 +13,7 @@ type SocialToken struct {
 	ExpiresAt   string `json:"expires_at"`
 }
 
+// Open opens a SQLite DB and ensures the kiromax_meta table exists.
 func Open(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -22,16 +23,19 @@ func Open(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// GetMeta returns the value for key from kiromax_meta, or "" if not found.
 func GetMeta(db *sql.DB, key string) string {
 	var v string
 	db.QueryRow(`SELECT value FROM kiromax_meta WHERE key=?`, key).Scan(&v)
 	return v
 }
 
+// SetMeta upserts a key/value pair in kiromax_meta.
 func SetMeta(db *sql.DB, key, val string) {
 	db.Exec(`INSERT OR REPLACE INTO kiromax_meta(key,value) VALUES(?,?)`, key, val)
 }
 
+// ReadToken reads the social OAuth token from auth_kv.
 func ReadToken(db *sql.DB) (token string, expiresAt time.Time) {
 	var raw string
 	if db.QueryRow(`SELECT value FROM auth_kv WHERE key='kirocli:social:token'`).Scan(&raw) == nil {

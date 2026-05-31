@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/Lumos-Labs-HQ/kiromax/internal/credits"
 	"github.com/Lumos-Labs-HQ/kiromax/internal/db"
@@ -78,6 +80,7 @@ func printHelp() {
 		{"  end <id>      ", "Mark a session as ended"},
 		{"  reset [<id>]  ", "Unend all sessions (or one), clearing used_at"},
 		{"  credits [<id>]", "Show live credit usage (defaults to active)"},
+		{"  continue, c   ", "Pick & resume a previous conversation (resume-picker)"},
 	}
 	for _, r := range rows {
 		fmt.Println(ui.Cyan(r[0]) + ui.Dim(r[1]))
@@ -268,6 +271,13 @@ func main() {
 			die("error:", err)
 		}
 		fmt.Println()
+
+	case "continue", "c":
+		bin, err := exec.LookPath("kiro-cli-chat")
+		if err != nil {
+			die("kiro-cli-chat not found in PATH")
+		}
+		syscall.Exec(bin, []string{"kiro-cli-chat", "chat", "--resume-picker"}, os.Environ())
 
 	default:
 		printHelp()
