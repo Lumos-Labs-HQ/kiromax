@@ -3,10 +3,10 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/Lumos-Labs-HQ/kiromax/internal/config"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/db"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/session"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/ui"
+	"github.com/Lumos-Labs-HQ/kmax/internal/config"
+	"github.com/Lumos-Labs-HQ/kmax/internal/db"
+	"github.com/Lumos-Labs-HQ/kmax/internal/session"
+	"github.com/Lumos-Labs-HQ/kmax/internal/ui"
 )
 
 func Swap() {
@@ -47,7 +47,7 @@ func Swap() {
 	}
 
 	ui.Fail("All sessions are ended or already used this month.")
-	fmt.Println(ui.Dim("  Run: kiromax reset   to unend all sessions"))
+	fmt.Println(ui.Dim("  Run: kmax reset   to unend all sessions"))
 }
 
 func Use(arg string) {

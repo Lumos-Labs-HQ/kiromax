@@ -1,4 +1,4 @@
-# kiromax
+# kmax
 
 Manage multiple kiro-cli accounts on a single machine. Swap between sessions, track monthly usage, and keep a unified conversation history across all accounts.
 
@@ -6,12 +6,13 @@ Manage multiple kiro-cli accounts on a single machine. Swap between sessions, tr
 
 Each account is stored as a `.sqlite3` file in `~/.local/share/kiro-cli/kiro_data/`. The active account is `~/.local/share/kiro-cli/data.sqlite3`.
 
-On every swap kiromax:
+On every swap kmax:
+
 1. Saves the current `data.sqlite3` back to the active session file (preserves chat history and refreshed tokens).
 2. Merges conversation history from all sessions into the target session, so `--resume` works regardless of which account is active.
 3. Copies the target session file to `data.sqlite3`.
 
-This means you can switch accounts mid-month and continue any previous conversation with `kiromax continue`.
+This means you can switch accounts mid-month and continue any previous conversation with `kmax continue`.
 
 ## Setup
 
@@ -25,14 +26,14 @@ mkdir -p ~/.local/share/kiro-cli/kiro_data
 ## Commands
 
 ```
-kiromax list              List all sessions with status
-kiromax swap              Mark current session as ended, switch to next unused this month
-kiromax use <id>          Switch to a specific session by ID or name
-kiromax end <id>          Mark a session as ended (skipped by swap)
-kiromax reset [<id>]      Unend all sessions (or one), clearing used_at
-kiromax credits [<id>]    Show live credit usage (defaults to active session)
-kiromax continue          Open the conversation picker to resume any previous chat
-kiromax c                 Alias for continue
+kmax list              List all sessions with status
+kmax swap              Mark current session as ended, switch to next unused this month
+kmax use <id>          Switch to a specific session by ID or name
+kmax end <id>          Mark a session as ended (skipped by swap)
+kmax reset [<id>]      Unend all sessions (or one), clearing used_at
+kmax credits [<id>]    Show live credit usage (defaults to active session)
+kmax continue          Open the conversation picker to resume any previous chat
+kmax c                 Alias for continue
 ```
 
 ## Session lifecycle
@@ -44,5 +45,5 @@ kiromax c                 Alias for continue
 ## Notes
 
 - Requires `kiro-cli-chat` to be on PATH for the `continue` command.
-- Session files must be readable and writable by the user running kiromax.
+- Session files must be readable and writable by the user running kmax.
 - The `credits` command reads the OAuth token stored in the session DB. For the active session it always reads from the live `data.sqlite3` in case kiro-cli has refreshed the token.

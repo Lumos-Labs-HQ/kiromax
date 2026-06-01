@@ -6,13 +6,13 @@ import (
 	"os/exec"
 	"syscall"
 
-	"github.com/Lumos-Labs-HQ/kiromax/internal/cmd"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/ui"
+	"github.com/Lumos-Labs-HQ/kmax/internal/cmd"
+	"github.com/Lumos-Labs-HQ/kmax/internal/ui"
 )
 
 func printHelp() {
 	fmt.Println()
-	fmt.Println(ui.Bold(ui.Cyan("kiromax")) + ui.Dim(" — Kiro session manager"))
+	fmt.Println(ui.Bold(ui.Cyan("kmax")) + ui.Dim(" — Kiro session manager"))
 	fmt.Println()
 	fmt.Println(ui.Bold("COMMANDS"))
 	rows := [][2]string{
@@ -46,7 +46,7 @@ func main() {
 		fmt.Println()
 	case "use":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: kiromax use <id>")
+			fmt.Fprintln(os.Stderr, "usage: kmax use <id>")
 			os.Exit(1)
 		}
 		fmt.Println()
@@ -54,7 +54,7 @@ func main() {
 		fmt.Println()
 	case "end":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: kiromax end <id|name>")
+			fmt.Fprintln(os.Stderr, "usage: kmax end <id|name>")
 			os.Exit(1)
 		}
 		fmt.Println()

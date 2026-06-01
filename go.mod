@@ -1,4 +1,4 @@
-module github.com/Lumos-Labs-HQ/kiromax
+module github.com/Lumos-Labs-HQ/kmax
 
 go 1.26.3
 

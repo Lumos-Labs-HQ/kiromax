@@ -6,8 +6,8 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/Lumos-Labs-HQ/kiromax/internal/config"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/ui"
+	"github.com/Lumos-Labs-HQ/kmax/internal/config"
+	"github.com/Lumos-Labs-HQ/kmax/internal/ui"
 )
 
 func Login() {
@@ -26,7 +26,7 @@ func Login() {
 		config.Die(fmt.Sprintf("session %q already exists", name))
 	}
 
-	tmp := config.DataDB + ".kiromax_tmp"
+	tmp := config.DataDB + ".kmax_tmp"
 	if err := config.CopyFile(config.DataDB, tmp); err != nil {
 		config.Die("failed to back up data.sqlite3:", err)
 	}
@@ -58,5 +58,5 @@ func Login() {
 	_ = os.Remove(tmp)
 
 	fmt.Println()
-	ui.Success(fmt.Sprintf("Session %s saved — run 'kiromax use %s' to switch to it", ui.Bold(name), name))
+	ui.Success(fmt.Sprintf("Session %s saved — run 'kmax use %s' to switch to it", ui.Bold(name), name))
 }

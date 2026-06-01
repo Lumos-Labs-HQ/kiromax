@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Lumos-Labs-HQ/kiromax/internal/db"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/session"
+	"github.com/Lumos-Labs-HQ/kmax/internal/db"
+	"github.com/Lumos-Labs-HQ/kmax/internal/session"
 )
 
 type usageBreakdown struct {

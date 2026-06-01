@@ -3,10 +3,10 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/Lumos-Labs-HQ/kiromax/internal/config"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/credits"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/session"
-	"github.com/Lumos-Labs-HQ/kiromax/internal/ui"
+	"github.com/Lumos-Labs-HQ/kmax/internal/config"
+	"github.com/Lumos-Labs-HQ/kmax/internal/credits"
+	"github.com/Lumos-Labs-HQ/kmax/internal/session"
+	"github.com/Lumos-Labs-HQ/kmax/internal/ui"
 )
 
 func Credits(arg string) {
@@ -24,7 +24,7 @@ func Credits(arg string) {
 			}
 		}
 		if s.FileName == "" {
-			config.Die("no active session; specify: kiromax credits <id|name>")
+			config.Die("no active session; specify: kmax credits <id|name>")
 		}
 	} else {
 		var err error
