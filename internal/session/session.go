@@ -53,7 +53,6 @@ func Load(name, kiroDataDir string) (Session, error) {
 }
 
 // List returns all sessions in kiroDataDir, sorted numerically then alphabetically.
-// The session whose UUID matches the active_uuid in data.sqlite3 is marked Active.
 func List(kiroDataDir, dataDB string) ([]Session, error) {
 	entries, err := os.ReadDir(kiroDataDir)
 	if err != nil {
@@ -106,92 +105,32 @@ func UsedThisMonth(s Session) bool {
 	return s.UsedAt.Year() == now.Year() && s.UsedAt.Month() == now.Month()
 }
 
-// syncMigrations copies any missing migration rows from src into dst.
-// This prevents kiro-cli from re-running migrations that were already applied
-// by a newer version of kiro-cli on a different session.
-func syncMigrations(srcPath, dstPath string) error {
-	src, err := db.Open(srcPath)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	dst, err := db.Open(dstPath)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-
-	rows, err := src.Query(`SELECT id, version, migration_time FROM migrations`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var id, version, migTime int64
-		if rows.Scan(&id, &version, &migTime) != nil {
-			continue
-		}
-		dst.Exec(`INSERT OR IGNORE INTO migrations(id, version, migration_time) VALUES(?,?,?)`,
-			id, version, migTime)
-	}
-	return nil
-}
 // mergeConversations copies conversations_v2 rows from src into dst.
-// When a conversation exists in both, the row with the later updated_at wins.
-func mergeConversations(srcPath, dstPath string) error {
+// Only runs if both files already have the table (kiro-cli ran its migrations).
+func mergeConversations(srcPath, dstPath string) {
 	src, err := db.Open(srcPath)
 	if err != nil {
-		return err
+		return
 	}
 	defer src.Close()
 
 	dst, err := db.Open(dstPath)
 	if err != nil {
-		return err
+		return
 	}
 	defer dst.Close()
 
-	// If src has no conversations_v2, nothing to merge.
-	var srcHas int
+	// Only merge if both sides already have the table — never create it ourselves.
+	var srcHas, dstHas int
 	src.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&srcHas)
-	if srcHas == 0 {
-		return nil
-	}
-
-	// If dst doesn't have conversations_v2, create it by copying the exact DDL
-	// and indexes from src (kiro-cli's original schema).
-	var tblExists int
-	dst.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblExists)
-	if tblExists == 0 {
-		var tblSQL string
-		src.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblSQL)
-		if _, err := dst.Exec(tblSQL); err != nil {
-			return err
-		}
-		idxRows, _ := src.Query(`SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='conversations_v2' AND sql IS NOT NULL`)
-		if idxRows != nil {
-			for idxRows.Next() {
-				var idxSQL string
-				if idxRows.Scan(&idxSQL) == nil {
-					dst.Exec(idxSQL)
-				}
-			}
-			idxRows.Close()
-		}
-		// Mark the migration that creates this table as done so kiro-cli doesn't re-run it.
-		// We look up the migration row from src to get the correct id/version.
-		var migID, migVersion int64
-		if src.QueryRow(`SELECT id, version FROM migrations WHERE version=7`).Scan(&migID, &migVersion) == nil {
-			now := time.Now().UnixMilli()
-			dst.Exec(`INSERT OR IGNORE INTO migrations(id, version, migration_time) VALUES(?,?,?)`, migID, migVersion, now)
-		}
+	dst.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&dstHas)
+	if srcHas == 0 || dstHas == 0 {
+		return
 	}
 
 	rows, err := src.Query(`SELECT key, conversation_id, value, created_at, updated_at FROM conversations_v2`)
 	if err != nil {
-		return nil
+		return
 	}
 	defer rows.Close()
 
@@ -205,51 +144,25 @@ func mergeConversations(srcPath, dstPath string) error {
 		tx.Exec(`INSERT INTO conversations_v2(key,conversation_id,value,created_at,updated_at)
 			VALUES(?,?,?,?,?)
 			ON CONFLICT(key,conversation_id) DO UPDATE SET
-				value=excluded.value,
-				updated_at=excluded.updated_at
+				value=excluded.value, updated_at=excluded.updated_at
 			WHERE excluded.updated_at > conversations_v2.updated_at`,
 			key, convID, value, createdAt, updatedAt)
 	}
-	return tx.Commit()
+	tx.Commit()
 }
 
-// repairConversationsTable rebuilds conversations_v2 with kiro-cli's exact DDL
-// if it was created with a different schema (e.g. by an older version of kiromax).
-func repairConversationsTable(dbPath string) {
+// normalizeStateToText ensures all rows in the state table are stored as TEXT.
+// Some sessions end up with BLOB values which kiro-cli's driver cannot read.
+func normalizeStateToText(dbPath string) {
 	d, err := db.Open(dbPath)
 	if err != nil {
 		return
 	}
 	defer d.Close()
-
-	var tblSQL string
-	if d.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblSQL) != nil {
-		return // table doesn't exist, nothing to repair
-	}
-	// kiro-cli's DDL always contains the milliseconds comment
-	if strings.Contains(tblSQL, "milliseconds") {
-		return // already correct
-	}
-	d.Exec(`
-		BEGIN;
-		ALTER TABLE conversations_v2 RENAME TO conversations_v2_old;
-		CREATE TABLE conversations_v2 (
-			key TEXT NOT NULL,
-			conversation_id TEXT NOT NULL,
-			value TEXT NOT NULL,
-			created_at INTEGER NOT NULL,  -- Unix timestamp in milliseconds
-			updated_at INTEGER NOT NULL,  -- Unix timestamp in milliseconds
-			PRIMARY KEY (key, conversation_id)
-		);
-		INSERT INTO conversations_v2 SELECT * FROM conversations_v2_old;
-		DROP TABLE conversations_v2_old;
-		CREATE INDEX IF NOT EXISTS idx_conversations_v2_key_updated ON conversations_v2(key, updated_at DESC);
-		CREATE INDEX IF NOT EXISTS idx_conversations_v2_updated_at ON conversations_v2(updated_at DESC);
-		COMMIT;
-	`)
+	d.Exec(`UPDATE state SET value = CAST(value AS TEXT) WHERE typeof(value) = 'blob'`)
 }
-// This preserves any state kiro-cli wrote during the session (refreshed tokens,
-// chat history) before we overwrite data.sqlite3 with a different session.
+
+// SyncActiveBack saves the live data.sqlite3 back to the active session file.
 func SyncActiveBack(dataDB, kiroDataDir string) error {
 	activeUUID := LiveActiveUUID(dataDB)
 	if activeUUID == "" {
@@ -273,14 +186,13 @@ func SyncActiveBack(dataDB, kiroDataDir string) error {
 
 // SwapTo switches the active session:
 //  1. Saves the current data.sqlite3 back to the active session file.
-//  2. Merges conversation history from all sessions into the target, so
-//     --resume works across account switches.
-//  3. Copies the target session file to data.sqlite3.
+//  2. Copies the target session file to data.sqlite3.
 func SwapTo(s Session, dataDB, kiroDataDir string) error {
 	if err := SyncActiveBack(dataDB, kiroDataDir); err != nil {
 		return fmt.Errorf("failed to sync active session back: %w", err)
 	}
 
+	// Merge conversation history from all sessions into target (only if tables exist).
 	entries, _ := os.ReadDir(kiroDataDir)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sqlite3") {
@@ -290,12 +202,10 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 		if srcPath == s.File {
 			continue
 		}
-		_ = mergeConversations(srcPath, s.File)
+		mergeConversations(srcPath, s.File)
 	}
 
-	// Sync migrations from the previously active session into the target file
-	// before activating it, so kiro-cli doesn't re-run already-applied migrations.
-	_ = syncMigrations(dataDB, s.File)
+	normalizeStateToText(s.File)
 
 	data, err := os.ReadFile(s.File)
 	if err != nil {
@@ -304,10 +214,6 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 	if err := os.WriteFile(dataDB, data, 0600); err != nil {
 		return err
 	}
-
-	// Repair schema if this session was created with an older kiromax that used wrong DDL.
-	repairConversationsTable(dataDB)
-	repairConversationsTable(s.File)
 
 	now := time.Now().Format(time.RFC3339)
 	for _, path := range []string{s.File, dataDB} {
