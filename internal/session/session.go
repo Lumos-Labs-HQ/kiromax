@@ -105,32 +105,85 @@ func UsedThisMonth(s Session) bool {
 	return s.UsedAt.Year() == now.Year() && s.UsedAt.Month() == now.Month()
 }
 
-// mergeConversations copies conversations_v2 rows from src into dst.
-// Only runs if both files already have the table (kiro-cli ran its migrations).
-func mergeConversations(srcPath, dstPath string) {
+// syncMigrations copies any missing migration rows from src into dst.
+func syncMigrations(srcPath, dstPath string) error {
 	src, err := db.Open(srcPath)
 	if err != nil {
-		return
+		return err
 	}
 	defer src.Close()
 
 	dst, err := db.Open(dstPath)
 	if err != nil {
-		return
+		return err
 	}
 	defer dst.Close()
 
-	// Only merge if both sides already have the table — never create it ourselves.
-	var srcHas, dstHas int
+	rows, err := src.Query(`SELECT id, version, migration_time FROM migrations`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, version, migTime int64
+		if rows.Scan(&id, &version, &migTime) != nil {
+			continue
+		}
+		dst.Exec(`INSERT OR IGNORE INTO migrations(id, version, migration_time) VALUES(?,?,?)`,
+			id, version, migTime)
+	}
+	return nil
+}
+
+// mergeConversations copies conversations_v2 rows from src into dst.
+func mergeConversations(srcPath, dstPath string) error {
+	src, err := db.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := db.Open(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	var srcHas int
 	src.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&srcHas)
-	dst.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&dstHas)
-	if srcHas == 0 || dstHas == 0 {
-		return
+	if srcHas == 0 {
+		return nil
+	}
+
+	var tblExists int
+	dst.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblExists)
+	if tblExists == 0 {
+		var tblSQL string
+		src.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblSQL)
+		if _, err := dst.Exec(tblSQL); err != nil {
+			return err
+		}
+		idxRows, _ := src.Query(`SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='conversations_v2' AND sql IS NOT NULL`)
+		if idxRows != nil {
+			for idxRows.Next() {
+				var idxSQL string
+				if idxRows.Scan(&idxSQL) == nil {
+					dst.Exec(idxSQL)
+				}
+			}
+			idxRows.Close()
+		}
+		var migID, migVersion int64
+		if src.QueryRow(`SELECT id, version FROM migrations WHERE version=7`).Scan(&migID, &migVersion) == nil {
+			now := time.Now().UnixMilli()
+			dst.Exec(`INSERT OR IGNORE INTO migrations(id, version, migration_time) VALUES(?,?,?)`, migID, migVersion, now)
+		}
 	}
 
 	rows, err := src.Query(`SELECT key, conversation_id, value, created_at, updated_at FROM conversations_v2`)
 	if err != nil {
-		return
+		return nil
 	}
 	defer rows.Close()
 
@@ -144,22 +197,46 @@ func mergeConversations(srcPath, dstPath string) {
 		tx.Exec(`INSERT INTO conversations_v2(key,conversation_id,value,created_at,updated_at)
 			VALUES(?,?,?,?,?)
 			ON CONFLICT(key,conversation_id) DO UPDATE SET
-				value=excluded.value, updated_at=excluded.updated_at
+				value=excluded.value,
+				updated_at=excluded.updated_at
 			WHERE excluded.updated_at > conversations_v2.updated_at`,
 			key, convID, value, createdAt, updatedAt)
 	}
-	tx.Commit()
+	return tx.Commit()
 }
 
-// normalizeStateToText ensures all rows in the state table are stored as TEXT.
-// Some sessions end up with BLOB values which kiro-cli's driver cannot read.
-func normalizeStateToText(dbPath string) {
+// repairConversationsTable rebuilds conversations_v2 with kiro-cli's exact DDL if schema differs.
+func repairConversationsTable(dbPath string) {
 	d, err := db.Open(dbPath)
 	if err != nil {
 		return
 	}
 	defer d.Close()
-	d.Exec(`UPDATE state SET value = CAST(value AS TEXT) WHERE typeof(value) = 'blob'`)
+
+	var tblSQL string
+	if d.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblSQL) != nil {
+		return
+	}
+	if strings.Contains(tblSQL, "milliseconds") {
+		return
+	}
+	d.Exec(`
+		BEGIN;
+		ALTER TABLE conversations_v2 RENAME TO conversations_v2_old;
+		CREATE TABLE conversations_v2 (
+			key TEXT NOT NULL,
+			conversation_id TEXT NOT NULL,
+			value TEXT NOT NULL,
+			created_at INTEGER NOT NULL,  -- Unix timestamp in milliseconds
+			updated_at INTEGER NOT NULL,  -- Unix timestamp in milliseconds
+			PRIMARY KEY (key, conversation_id)
+		);
+		INSERT INTO conversations_v2 SELECT * FROM conversations_v2_old;
+		DROP TABLE conversations_v2_old;
+		CREATE INDEX IF NOT EXISTS idx_conversations_v2_key_updated ON conversations_v2(key, updated_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_conversations_v2_updated_at ON conversations_v2(updated_at DESC);
+		COMMIT;
+	`)
 }
 
 // SyncActiveBack saves the live data.sqlite3 back to the active session file.
@@ -185,25 +262,16 @@ func SyncActiveBack(dataDB, kiroDataDir string) error {
 }
 
 // SwapTo switches the active session:
-//  1. Marks the current active session as ended in data.sqlite3 (before sync-back).
-//  2. Saves the current data.sqlite3 back to the active session file.
-//  3. Merges conversation history from all sessions into target.
+//  1. Saves the current data.sqlite3 back to the active session file (preserving it as-is).
+//  2. Merges conversation history from all sessions into the target.
+//  3. Syncs migrations from the current session into the target.
 //  4. Copies the target session file to data.sqlite3.
-//  5. Merges conversations into data.sqlite3 directly (handles fresh sessions
-//     where kiro-cli hasn't run migrations on the target file yet).
+//  5. Sets active_uuid and used_at on both files.
 func SwapTo(s Session, dataDB, kiroDataDir string) error {
-	// Mark current active as ended in data.sqlite3 BEFORE syncing back,
-	// so the ended flag is preserved when SyncActiveBack overwrites the session file.
-	if d, err := db.Open(dataDB); err == nil {
-		db.SetMeta(d, "ended", "true")
-		d.Close()
-	}
-
 	if err := SyncActiveBack(dataDB, kiroDataDir); err != nil {
 		return fmt.Errorf("failed to sync active session back: %w", err)
 	}
 
-	// Merge conversation history from all sessions into target file.
 	entries, _ := os.ReadDir(kiroDataDir)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sqlite3") {
@@ -213,10 +281,10 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 		if srcPath == s.File {
 			continue
 		}
-		mergeConversations(srcPath, s.File)
+		_ = mergeConversations(srcPath, s.File)
 	}
 
-	normalizeStateToText(s.File)
+	_ = syncMigrations(dataDB, s.File)
 
 	data, err := os.ReadFile(s.File)
 	if err != nil {
@@ -226,6 +294,9 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 		return err
 	}
 
+	repairConversationsTable(dataDB)
+	repairConversationsTable(s.File)
+
 	now := time.Now().Format(time.RFC3339)
 	for _, path := range []string{s.File, dataDB} {
 		d, err := db.Open(path)
@@ -234,24 +305,8 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 		}
 		db.SetMeta(d, "active_uuid", s.UUID)
 		db.SetMeta(d, "used_at", now)
-		db.SetMeta(d, "ended", "false")
 		d.Close()
 	}
-
-	// Also merge conversations directly into data.sqlite3. This handles the case
-	// where the target is a fresh session and kiro-cli hasn't created conversations_v2
-	// in the target file yet — but data.sqlite3 may already have it from a prior run.
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sqlite3") {
-			continue
-		}
-		srcPath := filepath.Join(kiroDataDir, e.Name())
-		if srcPath == s.File {
-			continue
-		}
-		mergeConversations(srcPath, dataDB)
-	}
-
 	return nil
 }
 

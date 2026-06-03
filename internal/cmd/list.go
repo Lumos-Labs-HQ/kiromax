@@ -22,16 +22,23 @@ func List() {
 
 	const (
 		wID     = 4
-		wName   = 12
 		wUUID   = 8
 		wStatus = 8
 	)
+
+	// Dynamic name column width.
+	wName := 4 // min width = len("NAME")
+	for _, s := range sessions {
+		if len(s.FileName) > wName {
+			wName = len(s.FileName)
+		}
+	}
 
 	fmt.Println()
 	header := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %s",
 		wID, "ID", wName, "NAME", wUUID, "UUID", wStatus, "STATUS", "LAST USED")
 	fmt.Println(ui.Bold(header))
-	fmt.Println("  " + ui.Dim(strings.Repeat("─", 56)))
+	fmt.Println("  " + ui.Dim(strings.Repeat("─", wID+wName+wUUID+wStatus+20)))
 
 	for _, s := range sessions {
 		status := "idle"

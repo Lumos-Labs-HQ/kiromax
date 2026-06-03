@@ -16,20 +16,29 @@ func Swap() {
 		config.Die("error:", err)
 	}
 
-	// Find and announce the current active session (SwapTo will end it).
+	// Mark the current active session as ended in its session file.
 	for _, s := range sessions {
 		if s.Active {
-			ui.Info(fmt.Sprintf("Ending session %s %s", ui.Bold(s.FileName), ui.Dim("["+s.UUID[:8]+"]")))
+			d, err := db.Open(s.File)
+			if err != nil {
+				config.Die("error:", err)
+			}
+			db.SetMeta(d, "ended", "true")
+			d.Close()
+			ui.Info(fmt.Sprintf("Saved & ended session %s %s", ui.Bold(s.FileName), ui.Dim("["+s.UUID[:8]+"]")))
 			break
 		}
+	}
+
+	// Re-list so the active session now shows as ended.
+	sessions, err = session.List(config.KiroDataDir, config.DataDB)
+	if err != nil {
+		config.Die("error:", err)
 	}
 
 	for _, s := range sessions {
 		if s.Ended || session.UsedThisMonth(s) {
 			continue
-		}
-		if s.Active {
-			continue // don't swap to the same session
 		}
 		if err := session.SwapTo(s, config.DataDB, config.KiroDataDir); err != nil {
 			config.Die("error:", err)
