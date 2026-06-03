@@ -185,14 +185,25 @@ func SyncActiveBack(dataDB, kiroDataDir string) error {
 }
 
 // SwapTo switches the active session:
-//  1. Saves the current data.sqlite3 back to the active session file.
-//  2. Copies the target session file to data.sqlite3.
+//  1. Marks the current active session as ended in data.sqlite3 (before sync-back).
+//  2. Saves the current data.sqlite3 back to the active session file.
+//  3. Merges conversation history from all sessions into target.
+//  4. Copies the target session file to data.sqlite3.
+//  5. Merges conversations into data.sqlite3 directly (handles fresh sessions
+//     where kiro-cli hasn't run migrations on the target file yet).
 func SwapTo(s Session, dataDB, kiroDataDir string) error {
+	// Mark current active as ended in data.sqlite3 BEFORE syncing back,
+	// so the ended flag is preserved when SyncActiveBack overwrites the session file.
+	if d, err := db.Open(dataDB); err == nil {
+		db.SetMeta(d, "ended", "true")
+		d.Close()
+	}
+
 	if err := SyncActiveBack(dataDB, kiroDataDir); err != nil {
 		return fmt.Errorf("failed to sync active session back: %w", err)
 	}
 
-	// Merge conversation history from all sessions into target (only if tables exist).
+	// Merge conversation history from all sessions into target file.
 	entries, _ := os.ReadDir(kiroDataDir)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sqlite3") {
@@ -223,8 +234,24 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 		}
 		db.SetMeta(d, "active_uuid", s.UUID)
 		db.SetMeta(d, "used_at", now)
+		db.SetMeta(d, "ended", "false")
 		d.Close()
 	}
+
+	// Also merge conversations directly into data.sqlite3. This handles the case
+	// where the target is a fresh session and kiro-cli hasn't created conversations_v2
+	// in the target file yet — but data.sqlite3 may already have it from a prior run.
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sqlite3") {
+			continue
+		}
+		srcPath := filepath.Join(kiroDataDir, e.Name())
+		if srcPath == s.File {
+			continue
+		}
+		mergeConversations(srcPath, dataDB)
+	}
+
 	return nil
 }
 
