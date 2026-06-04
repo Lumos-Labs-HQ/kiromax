@@ -159,21 +159,16 @@ func mergeConversations(srcPath, dstPath string) error {
 	var tblExists int
 	dst.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblExists)
 	if tblExists == 0 {
-		var tblSQL string
-		src.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblSQL)
-		if _, err := dst.Exec(tblSQL); err != nil {
-			return err
-		}
-		idxRows, _ := src.Query(`SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='conversations_v2' AND sql IS NOT NULL`)
-		if idxRows != nil {
-			for idxRows.Next() {
-				var idxSQL string
-				if idxRows.Scan(&idxSQL) == nil {
-					dst.Exec(idxSQL)
-				}
-			}
-			idxRows.Close()
-		}
+		dst.Exec(`CREATE TABLE IF NOT EXISTS conversations_v2 (
+			key TEXT NOT NULL,
+			conversation_id TEXT NOT NULL,
+			value TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (key, conversation_id)
+		)`)
+		dst.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_v2_key_updated ON conversations_v2(key, updated_at DESC)`)
+		dst.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_v2_updated_at ON conversations_v2(updated_at DESC)`)
 		var migID, migVersion int64
 		if src.QueryRow(`SELECT id, version FROM migrations WHERE version=7`).Scan(&migID, &migVersion) == nil {
 			now := time.Now().UnixMilli()
@@ -205,6 +200,32 @@ func mergeConversations(srcPath, dstPath string) error {
 	return tx.Commit()
 }
 
+// repairStateTable ensures state uses value BLOB (required by kiro-cli 1.29.7+) and
+// removes welcomeAnnouncement.showCount which kiro-cli rejects as TEXT.
+func repairStateTable(dbPath string) {
+	d, err := db.Open(dbPath)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+
+	var tblSQL string
+	if d.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='state'`).Scan(&tblSQL) != nil {
+		return
+	}
+	if !strings.Contains(tblSQL, "value BLOB") {
+		d.Exec(`DELETE FROM state WHERE key='welcomeAnnouncement.showCount'`)
+		d.Exec(`BEGIN`)
+		d.Exec(`ALTER TABLE state RENAME TO state_old`)
+		d.Exec(`CREATE TABLE state (key TEXT PRIMARY KEY, value BLOB)`)
+		d.Exec(`INSERT INTO state SELECT key, value FROM state_old`)
+		d.Exec(`DROP TABLE state_old`)
+		d.Exec(`COMMIT`)
+	} else {
+		d.Exec(`DELETE FROM state WHERE key='welcomeAnnouncement.showCount'`)
+	}
+}
+
 // repairConversationsTable rebuilds conversations_v2 with kiro-cli's exact DDL if schema differs.
 func repairConversationsTable(dbPath string) {
 	d, err := db.Open(dbPath)
@@ -217,26 +238,37 @@ func repairConversationsTable(dbPath string) {
 	if d.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='conversations_v2'`).Scan(&tblSQL) != nil {
 		return
 	}
-	if strings.Contains(tblSQL, "milliseconds") {
+	wantsRepair := !strings.Contains(tblSQL, "milliseconds")
+
+	if !wantsRepair {
 		return
 	}
-	d.Exec(`
-		BEGIN;
-		ALTER TABLE conversations_v2 RENAME TO conversations_v2_old;
-		CREATE TABLE conversations_v2 (
-			key TEXT NOT NULL,
-			conversation_id TEXT NOT NULL,
-			value TEXT NOT NULL,
-			created_at INTEGER NOT NULL,  -- Unix timestamp in milliseconds
-			updated_at INTEGER NOT NULL,  -- Unix timestamp in milliseconds
-			PRIMARY KEY (key, conversation_id)
-		);
-		INSERT INTO conversations_v2 SELECT * FROM conversations_v2_old;
-		DROP TABLE conversations_v2_old;
-		CREATE INDEX IF NOT EXISTS idx_conversations_v2_key_updated ON conversations_v2(key, updated_at DESC);
-		CREATE INDEX IF NOT EXISTS idx_conversations_v2_updated_at ON conversations_v2(updated_at DESC);
-		COMMIT;
-	`)
+
+	d.Exec(`BEGIN`)
+	d.Exec(`ALTER TABLE conversations_v2 RENAME TO conversations_v2_old`)
+	d.Exec(`CREATE TABLE conversations_v2 (
+		key TEXT NOT NULL,
+		conversation_id TEXT NOT NULL,
+		value TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (key, conversation_id)
+	)`)
+	d.Exec(`INSERT INTO conversations_v2 SELECT * FROM conversations_v2_old`)
+	d.Exec(`DROP TABLE conversations_v2_old`)
+	d.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_v2_key_updated ON conversations_v2(key, updated_at DESC)`)
+	d.Exec(`CREATE INDEX IF NOT EXISTS idx_conversations_v2_updated_at ON conversations_v2(updated_at DESC)`)
+	d.Exec(`COMMIT`)
+}
+
+// ensureConversationsTable creates the legacy conversations table required by kiro-cli 1.29.7+.
+func ensureConversationsTable(dbPath string) {
+	d, err := db.Open(dbPath)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	d.Exec(`CREATE TABLE IF NOT EXISTS conversations (key TEXT PRIMARY KEY, value TEXT)`)
 }
 
 // SyncActiveBack saves the live data.sqlite3 back to the active session file.
@@ -294,8 +326,12 @@ func SwapTo(s Session, dataDB, kiroDataDir string) error {
 		return err
 	}
 
+	repairStateTable(dataDB)
+	repairStateTable(s.File)
 	repairConversationsTable(dataDB)
 	repairConversationsTable(s.File)
+	ensureConversationsTable(dataDB)
+	ensureConversationsTable(s.File)
 
 	now := time.Now().Format(time.RFC3339)
 	for _, path := range []string{s.File, dataDB} {
