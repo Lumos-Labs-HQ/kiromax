@@ -16,10 +16,11 @@ func Swap() {
 		config.Die("error:", err)
 	}
 
-	// Mark the current active session as ended in its session file.
+	// Mark the current active session as ended in data.sqlite3 BEFORE SyncActiveBack
+	// so the ended flag is preserved when the live file is copied back to s.File.
 	for _, s := range sessions {
 		if s.Active {
-			d, err := db.Open(s.File)
+			d, err := db.Open(config.DataDB)
 			if err != nil {
 				config.Die("error:", err)
 			}
@@ -30,26 +31,32 @@ func Swap() {
 		}
 	}
 
-	// Re-list so the active session now shows as ended.
+	// Re-list so ended flags are reflected.
 	sessions, err = session.List(config.KiroDataDir, config.DataDB)
 	if err != nil {
 		config.Die("error:", err)
 	}
 
+	var available []session.Session
 	for _, s := range sessions {
-		if s.Ended || session.UsedThisMonth(s) {
-			continue
+		if !s.Ended && !session.UsedThisMonth(s) {
+			available = append(available, s)
 		}
-		if err := session.SwapTo(s, config.DataDB, config.KiroDataDir); err != nil {
-			config.Die("error:", err)
-		}
-		ui.Success(fmt.Sprintf("Swapped to session %s %s — restart kiro-cli to apply",
-			ui.Bold(s.FileName), ui.Dim("["+s.UUID[:8]+"]")))
+	}
+
+	if len(available) == 0 {
+		ui.Fail("All sessions are ended or already used this month.")
+		fmt.Println(ui.Dim("  Run: kmax reset   to unend all sessions"))
 		return
 	}
 
-	ui.Fail("All sessions are ended or already used this month.")
-	fmt.Println(ui.Dim("  Run: kmax reset   to unend all sessions"))
+	for _, s := range available {
+		if err := session.SwapTo(s, config.DataDB, config.KiroDataDir); err != nil {
+			config.Die("error:", err)
+		}
+		ui.Success(fmt.Sprintf("Swapped to session %s %s", ui.Bold(s.FileName), ui.Dim("["+s.UUID[:8]+"]")))
+	}
+	fmt.Println(ui.Dim("  Restart kiro-cli to apply"))
 }
 
 func Use(arg string) {
